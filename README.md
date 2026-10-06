@@ -1,246 +1,94 @@
-# ClipMatch 🎬
+# ClipMatch — Video Similarity Engine
 
-**NCC-based video fingerprinting API** — Upload a short query clip and instantly find which stored video it came from and at exactly what timestamp.
+ClipMatch is a fast, two-pass video matching engine that finds the exact timestamp of a short query clip within a large database of reference videos. It uses **Normalized Cross-Correlation (NCC)** on grayscale frames to determine similarity.
 
----
+## System Logic
 
-## Architecture Overview
+The system is designed to be highly accurate while minimizing unnecessary computation. It operates in two main phases:
 
-```
-clipmatch/
-├── main.py                   # FastAPI app factory + lifespan + health routes
-├── config.py                 # Centralized .env config
-├── database.py               # Motor async MongoDB client (lazy init)
-├── ingest.py                 # Offline ingestion script (run once per new video)
-├── routers/
-│   └── match.py              # POST /match endpoint
-├── services/
-│   ├── frame_extractor.py    # OpenCV frame extraction & preprocessing
-│   ├── ncc.py                # Pure NumPy NCC engine
-│   └── matcher.py            # Two-pass coarse/fine NCC orchestration
-├── .env                      # Environment configuration
-├── requirements.txt
-└── README.md
-```
+### 1. Ingestion (Offline)
+Before matching, the reference videos in your database must be ingested.
+- The `ingest.py` script scans the `db_videos/` directory.
+- It extracts frames at two rates: **Coarse (1 FPS)** and **Fine (24 FPS)**.
+- Frames are preprocessed (grayscale, resized to 256x256, normalized) and saved as PNGs.
+- Metadata (video ID, timestamp, frame paths) is pushed to a **MongoDB** database.
 
-### Two-Pass NCC Matching
+### 2. Matching (Online)
+When a query clip is provided, the matching pipeline runs a **Two-Pass NCC** algorithm:
 
-```
-Query Clip Upload
-      │
-      ▼
-┌─────────────────────────────────────┐
-│  Pass 1 — Coarse Search (1 FPS)     │
-│  • Extract query frames @ 1 FPS     │
-│  • Load all DB frames @ 1 FPS       │
-│  • Sliding-window NCC per video_id  │
-│  • Threshold: NCC ≥ 0.75            │
-└────────────────┬────────────────────┘
-                 │ candidates (video_id + rough timestamp)
-                 ▼
-┌─────────────────────────────────────┐
-│  Pass 2 — Fine Search (24 FPS)      │
-│  • Extract query frames @ 24 FPS    │
-│  • Extract DB window @ 24 FPS       │
-│  • Sliding-window NCC over window   │
-│  • Threshold: NCC ≥ 0.85            │
-└────────────────┬────────────────────┘
-                 │
-                 ▼
-         JSON Response
-```
+- **Pass 1: Coarse Search (Live Extraction)**
+  - Frames are extracted live from the reference video files at 1 FPS and compared against the query clip at 1 FPS.
+  - **Optimization:** You can choose the **Faster (Diagonal)** method, which computes NCC *only* on the diagonal pixels of the frames (256 pixels instead of 65,536). This provides a massive speedup (~256x faster) while still filtering out completely unrelated videos.
+  - Windows of time that score above `NCC_COARSE_THRESHOLD` are flagged as candidates.
 
-### Concurrency Design
-
-The NCC computation is **CPU-bound**. The `match_endpoint` is declared `async def` but delegates heavy work to `asyncio.run_in_executor(None, ...)` which schedules it on Python's default `ThreadPoolExecutor`. This keeps the **ASGI event loop completely unblocked** during matching.
+- **Pass 2: Fine Search**
+  - For candidate windows found in Pass 1, the system extracts frames at 24 FPS from both the query clip and the localized 5-second window of the reference video.
+  - A full 256x256 sliding-window NCC is performed.
+  - The window with the highest score above `NCC_FINE_THRESHOLD` is returned as the exact match.
 
 ---
 
-## Quick Start
+## Setup & Installation
 
 ### 1. Prerequisites
+- Python 3.10+
+- A MongoDB cluster (e.g., MongoDB Atlas)
 
-- Python 3.11+
-- MongoDB running locally on port `27017`
-- `ffmpeg` (optional, for video transcoding)
-
-### 2. Install dependencies
-
+### 2. Install Dependencies
 ```bash
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# Mac/Linux
+source .venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
-### 3. Configure environment
-
-Edit `.env` to match your setup:
+### 3. Environment Configuration
+Create a `.env` file in the root directory (the system will use sensible defaults if not provided, but you must configure your MongoDB URI):
 
 ```dotenv
-MONGO_URI=mongodb://localhost:27017
+# MongoDB Configuration
+MONGO_URI=mongodb+srv://<username>:<password>@cluster0...
 MONGO_DB_NAME=clipmatch
 
+# Path Configuration
 DB_VIDEOS_DIR=./db_videos
 PROCESSED_FRAMES_DIR=./processed_frames
 QUERY_UPLOAD_DIR=./tmp/queries
 
-NCC_COARSE_THRESHOLD=0.75
-NCC_FINE_THRESHOLD=0.85
+# Matching Configuration
+NCC_COARSE_THRESHOLD=0.45
+NCC_FINE_THRESHOLD=0.60
 COARSE_FPS=1
 FINE_FPS=24
 FRAME_SIZE=256
 ```
 
-### 4. Add database videos
+---
 
-Place your video files in `./db_videos/`. The filename stem becomes the `video_id`:
+## How to Run
 
-```
-db_videos/
-  vid_001.mp4   →  video_id = "vid_001"
-  vid_042.mp4   →  video_id = "vid_042"
-```
-
-### 5. Run ingestion (offline, one-time)
-
+### Step 1: Ingest Database Videos
+Place your reference video files (`.mp4`, `.mkv`, etc.) into the `./db_videos/` directory, then run the ingestion script:
 ```bash
 python ingest.py
 ```
+*(To forcefully re-ingest videos that are already in the DB, run `python ingest.py --force`)*
 
-**Options:**
+### Step 2: Match a Query Clip
 
-| Flag | Description |
-|------|-------------|
-| `--videos-dir PATH` | Override `DB_VIDEOS_DIR` from `.env` |
-| `--force` | Re-ingest videos already in MongoDB |
-
-The script will:
-- Extract frames at 1 FPS and 24 FPS for each video
-- Save each frame as a 256×256 grayscale PNG to `processed_frames/<video_id>/<fps>fps/`
-- Insert frame metadata documents into `MongoDB.clipmatch.frames`
-
-### 6. Start the API server
-
+**Option A: Command Line Interface (Recommended for local testing)**
+Run the CLI to match a clip directly from your terminal. It bypasses the web server and runs the logic locally.
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+python cli.py
 ```
+You will be prompted to enter the path to your query clip and choose between the **Standard** (Full NCC) or **Faster** (Diagonal NCC) matching methods.
 
-Or directly:
-
+**Option B: FastAPI Web Server**
+Start the web server to expose the matching engine as a REST API.
 ```bash
-python main.py
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
-
----
-
-## API Reference
-
-### `POST /match`
-
-Upload a query video clip for fingerprint matching.
-
-**Request:** `multipart/form-data`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `file` | `UploadFile` | Query video clip (mp4, avi, mkv, mov, webm) |
-
-**Response — Match Found (200):**
-
-```json
-{
-  "status": "match_found",
-  "video_id": "vid_042",
-  "timestamp": "01:24",
-  "confidence": 0.8823
-}
-```
-
-**Response — No Match (200):**
-
-```json
-{
-  "status": "no_match",
-  "message": "Query clip not found in database."
-}
-```
-
-**Response — DB Empty (503):**
-
-```json
-{
-  "detail": "Database is empty. Please run ingest.py first."
-}
-```
-
-### `GET /health`
-
-Liveness probe.
-
-```json
-{
-  "status": "ok",
-  "database": "connected",
-  "latency_ms": 1.23
-}
-```
-
-### `GET /`
-
-API info and endpoint listing.
-
-### `GET /docs`
-
-Interactive Swagger UI.
-
----
-
-## Example — cURL
-
-```bash
-curl -X POST http://localhost:8000/match \
-  -H "Content-Type: multipart/form-data" \
-  -F "file=@/path/to/query_clip.mp4"
-```
-
-## Example — Python
-
-```python
-import requests
-
-with open("query_clip.mp4", "rb") as f:
-    response = requests.post(
-        "http://localhost:8000/match",
-        files={"file": ("query_clip.mp4", f, "video/mp4")},
-    )
-
-print(response.json())
-# {'status': 'match_found', 'video_id': 'vid_042', 'timestamp': '01:24', 'confidence': 0.88}
-```
-
----
-
-## MongoDB Schema
-
-**Collection: `frames`**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `video_id` | `str` | Video identifier (filename stem) |
-| `frame_path` | `str` | Absolute path to the PNG frame on disk |
-| `timestamp_sec` | `float` | Position in source video (seconds) |
-| `fps` | `int` | Extraction rate (`1` = coarse, `24` = fine) |
-
-**Indexes:**
-- `(video_id, fps)` — compound index for targeted lookups
-- `fps` — for filtering all coarse/fine docs
-
----
-
-## Tuning
-
-| Parameter | Default | Effect |
-|-----------|---------|--------|
-| `NCC_COARSE_THRESHOLD` | `0.75` | Lower → more candidates, slower fine pass |
-| `NCC_FINE_THRESHOLD` | `0.85` | Lower → more false positives |
-| `COARSE_FPS` | `1` | Higher → better coarse recall, more DB storage |
-| `FINE_FPS` | `24` | Lower → faster but less precise timestamps |
-| `FRAME_SIZE` | `256` | Higher → more accurate but slower NCC |
+You can then send a `multipart/form-data` POST request containing the video file to `http://localhost:8000/match`.
