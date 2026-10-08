@@ -50,6 +50,7 @@ class MatchResult:
     """Outcome of a two-pass NCC match attempt."""
     matched: bool
     video_id: str = ""
+    video_filename: str = ""
     timestamp_sec: float = 0.0
     confidence: float = 0.0
     # Diagnostics: best score per video from coarse pass
@@ -196,6 +197,7 @@ def _fine_search(
     query_clip_path: str | Path,
     video_path: str | Path,
     candidate_windows: list[tuple[float, float]],
+    query_duration_sec: float,
     window_padding_sec: float = 5.0,
     method: str = "standard",
 ) -> tuple[float, float] | None:
@@ -221,13 +223,14 @@ def _fine_search(
         return None
 
     overall_best: tuple[float, float] | None = None
+    absolute_best_score = 0.0
 
     # Determine unique time windows to search (merge overlapping windows)
     timestamps = sorted({t for _, t in candidate_windows})
 
     for ts in timestamps:
         start = max(0.0, ts - window_padding_sec)
-        end = ts + window_padding_sec
+        end = ts + query_duration_sec + window_padding_sec
 
         db_frames_fine = extract_frames_in_window(video_path, start, end, FINE_FPS)
         if not db_frames_fine:
@@ -236,15 +239,27 @@ def _fine_search(
         scored = sliding_window_ncc(query_frames_only, db_frames_fine, step=1, method=method)
         best = best_ncc_result(scored)
 
-        if best and best[0] >= NCC_FINE_THRESHOLD:
-            if overall_best is None or best[0] > overall_best[0]:
-                overall_best = best
-                logger.info(
-                    "Fine hit: video='%s', ts=%.2fs, score=%.4f",
-                    video_path,
-                    best[1],
-                    best[0],
-                )
+        if best:
+            if best[0] > absolute_best_score:
+                absolute_best_score = best[0]
+            
+            if best[0] >= NCC_FINE_THRESHOLD:
+                if overall_best is None or best[0] > overall_best[0]:
+                    overall_best = best
+                    logger.info(
+                        "Fine hit: video='%s', ts=%.2fs, score=%.4f",
+                        video_path,
+                        best[1],
+                        best[0],
+                    )
+
+    if overall_best is None:
+        logger.info(
+            "Fine miss: video='%s', best score was %.4f (threshold=%.2f)",
+            video_path,
+            absolute_best_score,
+            NCC_FINE_THRESHOLD,
+        )
 
     return overall_best
 
@@ -273,66 +288,68 @@ def match_query_clip_live(
     Returns:
         MatchResult with diagnostics.
     """
-    logger.info("Starting LIVE coarse search for query: %s", query_clip_path)
+    logger.info("Starting LIVE search (early stopping enabled) for query: %s", query_clip_path)
 
-    # ── Pass 1: Coarse (live extraction) ──────────────────────────────────────
     query_frames_coarse = extract_frames_at_fps(query_clip_path, coarse_fps)
-
     if not query_frames_coarse:
         logger.error("No frames extracted from query clip '%s'", query_clip_path)
         return MatchResult(matched=False)
 
     logger.info("Query clip: %d frames at %d FPS", len(query_frames_coarse), coarse_fps)
+    query_frames_only = [f for f, _ in query_frames_coarse]
+    n_query = len(query_frames_only)
+    query_duration_sec = n_query / coarse_fps
 
-    candidates, best_per_video = _coarse_search_live(
-        query_frames_coarse, db_video_paths, coarse_fps, method=method
-    )
+    best_per_video: dict[str, tuple[float, float]] = {}
+    total_videos = len(db_video_paths)
 
-    # Log summary
-    if best_per_video:
-        sorted_videos = sorted(best_per_video.items(), key=lambda x: x[1][0], reverse=True)
-        logger.info("=== Coarse Search Summary (top 5) ===")
-        for vid, (score, ts) in sorted_videos[:5]:
-            marker = " <-- CANDIDATE" if vid in candidates else ""
-            logger.info("  %-25s  NCC=%.4f  @ t=%.1fs%s", vid, score, ts, marker)
+    for idx, (video_id, video_path) in enumerate(db_video_paths.items(), 1):
+        logger.info(
+            "Coarse [%d/%d]: extracting frames from '%s' @ %d FPS...",
+            idx, total_videos, video_id, coarse_fps,
+        )
 
-    if not candidates:
-        logger.info("Coarse search: no candidates found above threshold %.2f.", NCC_COARSE_THRESHOLD)
-        return MatchResult(matched=False, coarse_scores=best_per_video)
-
-    # ── Pass 2: Fine ──────────────────────────────────────────────────────────
-    logger.info("Starting fine search over %d candidate video(s).", len(candidates))
-
-    overall_best: tuple[float, float, str] | None = None  # (score, ts, video_id)
-
-    for video_id, candidate_windows in candidates.items():
-        video_path = db_video_paths.get(video_id)
-        if not video_path:
-            logger.warning("No video file path for video_id='%s'", video_id)
+        try:
+            db_frames = extract_frames_at_fps(video_path, coarse_fps)
+        except IOError as exc:
+            logger.warning("Cannot open '%s': %s", video_path, exc)
             continue
 
-        fine_result = _fine_search(query_clip_path, video_path, candidate_windows, method=method)
+        if len(db_frames) < n_query:
+            logger.info("Coarse [%d/%d]: '%s' has only %d frames. Skipping.", idx, total_videos, video_id, len(db_frames))
+            continue
 
-        if fine_result:
-            score, ts = fine_result
-            if overall_best is None or score > overall_best[0]:
-                overall_best = (score, ts, video_id)
+        logger.info("Coarse [%d/%d]: comparing %d query vs %d DB frames (method=%s)...", idx, total_videos, n_query, len(db_frames), method)
+        scored = sliding_window_ncc(query_frames_only, db_frames, step=1, method=method)
 
-    if overall_best:
-        best_score, best_ts, best_vid = overall_best
-        logger.info(
-            "MATCH: video='%s', timestamp=%.2fs, confidence=%.4f",
-            best_vid, best_ts, best_score,
-        )
-        return MatchResult(
-            matched=True,
-            video_id=best_vid,
-            timestamp_sec=best_ts,
-            confidence=round(best_score, 4),
-            coarse_scores=best_per_video,
-        )
+        if not scored:
+            continue
 
-    logger.info("Fine search: no match above threshold %.2f.", NCC_FINE_THRESHOLD)
+        best_score, best_ts = max(scored, key=lambda x: x[0])
+        best_per_video[video_id] = (best_score, best_ts)
+        
+        above_threshold = [(s, t) for s, t in scored if s >= NCC_COARSE_THRESHOLD]
+        if above_threshold:
+            logger.info("Coarse HIT: '%s' — %d windows above threshold %.2f", video_id, len(above_threshold), NCC_COARSE_THRESHOLD)
+            
+            logger.info("Starting fine search for candidate '%s'...", video_id)
+            fine_result = _fine_search(query_clip_path, video_path, above_threshold, query_duration_sec, method=method)
+            
+            if fine_result:
+                fine_score, fine_ts = fine_result
+                logger.info("EARLY STOP MATCH FOUND: video='%s', timestamp=%.2fs, confidence=%.4f", video_id, fine_ts, fine_score)
+                return MatchResult(
+                    matched=True,
+                    video_id=video_id,
+                    video_filename=Path(video_path).name,
+                    timestamp_sec=fine_ts,
+                    confidence=round(fine_score, 4),
+                    coarse_scores=best_per_video,
+                )
+        else:
+            logger.info("Coarse miss: '%s' best NCC = %.4f", video_id, best_score)
+
+    logger.info("Search complete: no match found across all %d videos.", total_videos)
     return MatchResult(matched=False, coarse_scores=best_per_video)
 
 

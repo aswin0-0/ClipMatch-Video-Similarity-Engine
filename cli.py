@@ -106,6 +106,7 @@ def main():
     if result.matched:
         print("  MATCH FOUND!")
         print(f"  Video ID   : {result.video_id}")
+        print(f"  File Name  : {result.video_filename}")
         print(f"  Timestamp  : {result.timestamp_str} (at {result.timestamp_sec:.2f}s)")
         print(f"  Confidence : {result.confidence:.4f}")
     else:
