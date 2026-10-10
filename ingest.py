@@ -3,7 +3,8 @@ ingest.py — Offline database ingestion script for ClipMatch.
 
 Run this script once (or whenever new videos are added) to:
   1. Scan DB_VIDEOS_DIR for video files.
-  2. Extract frames at COARSE_FPS (1 FPS) and FINE_FPS (24 FPS).
+  2. Extract frames at COARSE_FPS (1 FPS). Fine frames are extracted live by
+      the matcher unless STORE_FINE_FRAMES=true.
   3. Save each frame as a lossless PNG to PROCESSED_FRAMES_DIR.
   4. Store frame metadata in MongoDB (collection: "frames").
 
@@ -41,6 +42,7 @@ from config import (
     MONGO_DB_NAME,
     MONGO_URI,
     PROCESSED_FRAMES_DIR,
+    STORE_FINE_FRAMES,
     ensure_directories,
 )
 
@@ -209,8 +211,8 @@ def ingest(videos_dir: Path, force: bool = False) -> None:
 
         logger.info("Ingesting '%s' (video_id='%s') …", video_path.name, video_id)
 
-        # Ingest at both coarse and fine FPS rates
-        for fps in (COARSE_FPS, FINE_FPS):
+        extraction_rates = (COARSE_FPS, FINE_FPS) if STORE_FINE_FRAMES else (COARSE_FPS,)
+        for fps in extraction_rates:
             n = _ingest_video(video_path, video_id, fps, frames_col)
             total_frames += n
 
@@ -255,6 +257,7 @@ if __name__ == "__main__":
     logger.info("MongoDB URI   : %s", MONGO_URI)
     logger.info("Coarse FPS    : %d", COARSE_FPS)
     logger.info("Fine FPS      : %d", FINE_FPS)
+    logger.info("Store fine frames: %s", STORE_FINE_FRAMES)
     logger.info("Frame size    : %dx%d", FRAME_SIZE, FRAME_SIZE)
     logger.info("Force re-ingest: %s", args.force)
     logger.info("=" * 40)

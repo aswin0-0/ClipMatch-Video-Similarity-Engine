@@ -30,16 +30,24 @@ import numpy as np
 
 from config import (
     COARSE_FPS,
+    ENABLE_MIRROR_MATCHING,
+    ENABLE_PATCH_EARLY_REJECTION,
     FINE_FPS,
+    FINE_SEARCH_WINDOW_SEC,
     NCC_COARSE_THRESHOLD,
     NCC_FINE_THRESHOLD,
+    PATCH_GRID_SIZE,
+    PATCH_MIN_PASS_RATIO,
+    PATCH_SCORE_THRESHOLD,
+    WINDOW_PADDING_SEC,
 )
 from services.frame_extractor import (
     extract_frames_at_fps,
     extract_frames_in_window,
+    get_video_duration_sec,
     load_frame_from_disk,
 )
-from services.ncc import best_ncc_result, sliding_window_ncc
+from services.ncc import best_ncc_result, sliding_window_ncc, sliding_window_ncc_oriented
 
 logger = logging.getLogger(__name__)
 
@@ -52,16 +60,41 @@ class MatchResult:
     video_id: str = ""
     video_filename: str = ""
     timestamp_sec: float = 0.0
+    start_timestamp_sec: float | None = None
+    end_timestamp_sec: float | None = None
     confidence: float = 0.0
+    match_orientation: str = "normal"
     # Diagnostics: best score per video from coarse pass
     coarse_scores: dict = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if self.start_timestamp_sec is None:
+            self.start_timestamp_sec = self.timestamp_sec
+        else:
+            self.timestamp_sec = self.start_timestamp_sec
+        if self.end_timestamp_sec is None:
+            self.end_timestamp_sec = self.start_timestamp_sec
+
     @property
     def timestamp_str(self) -> str:
-        """Format timestamp as MM:SS."""
-        minutes = int(self.timestamp_sec) // 60
-        seconds = int(self.timestamp_sec) % 60
+        """Backward-compatible alias for the formatted start timestamp."""
+        return self.start_timestamp_str
+
+    @staticmethod
+    def _format_timestamp(timestamp_sec: float) -> str:
+        minutes = int(timestamp_sec) // 60
+        seconds = int(timestamp_sec) % 60
         return f"{minutes:02d}:{seconds:02d}"
+
+    @property
+    def start_timestamp_str(self) -> str:
+        """Format the match start timestamp as MM:SS."""
+        return self._format_timestamp(self.start_timestamp_sec or 0.0)
+
+    @property
+    def end_timestamp_str(self) -> str:
+        """Format the exclusive match end timestamp as MM:SS."""
+        return self._format_timestamp(self.end_timestamp_sec or 0.0)
 
 
 # ── Type alias for MongoDB frame documents ────────────────────────────────────
@@ -127,7 +160,16 @@ def _coarse_search_live(
             idx, total_videos, n_query, len(db_frames), method,
         )
 
-        scored = sliding_window_ncc(query_frames_only, db_frames, step=1, method=method)
+        scored = sliding_window_ncc(
+            query_frames_only,
+            db_frames,
+            step=1,
+            method=method,
+            enable_patch_early_rejection=ENABLE_PATCH_EARLY_REJECTION,
+            patch_grid_size=PATCH_GRID_SIZE,
+            patch_score_threshold=PATCH_SCORE_THRESHOLD,
+            patch_min_pass_ratio=PATCH_MIN_PASS_RATIO,
+        )
 
         if scored:
             best_score, best_ts = max(scored, key=lambda x: x[0])
@@ -182,7 +224,15 @@ def _coarse_search(
     candidates: dict[str, list[tuple[float, float]]] = {}
 
     for video_id, db_frames in by_video.items():
-        scored = sliding_window_ncc(query_frames, db_frames, step=1)
+        scored = sliding_window_ncc(
+            query_frames,
+            db_frames,
+            step=1,
+            enable_patch_early_rejection=ENABLE_PATCH_EARLY_REJECTION,
+            patch_grid_size=PATCH_GRID_SIZE,
+            patch_score_threshold=PATCH_SCORE_THRESHOLD,
+            patch_min_pass_ratio=PATCH_MIN_PASS_RATIO,
+        )
         above_threshold = [(s, t) for s, t in scored if s >= NCC_COARSE_THRESHOLD]
 
         if above_threshold:
@@ -198,9 +248,11 @@ def _fine_search(
     video_path: str | Path,
     candidate_windows: list[tuple[float, float]],
     query_duration_sec: float,
-    window_padding_sec: float = 5.0,
+    window_padding_sec: float = WINDOW_PADDING_SEC,
     method: str = "standard",
-) -> tuple[float, float] | None:
+    query_frames_fine: list[tuple[np.ndarray, float]] | None = None,
+    mirror_matching: bool = ENABLE_MIRROR_MATCHING,
+) -> tuple[float, float, str] | None:
     """
     Perform high-FPS NCC over the localized candidate windows.
 
@@ -210,34 +262,68 @@ def _fine_search(
         candidate_windows: List of (score, timestamp_sec) from coarse pass.
         window_padding_sec: Extra seconds added around each window boundary.
         method:             'standard' or 'diagonal'.
+        query_frames_fine:  Optional pre-extracted query frames for reuse.
+        mirror_matching:    Compare normal and horizontally mirrored frames.
 
     Returns:
-        (best_score, best_timestamp_sec) or None if no window exceeds NCC_FINE_THRESHOLD.
+        (best_score, best_timestamp_sec, orientation) or None if no window
+        exceeds NCC_FINE_THRESHOLD.
     """
-    # Extract query frames at fine rate once
-    query_frames_fine = extract_frames_at_fps(query_clip_path, FINE_FPS)
+    if query_frames_fine is None:
+        query_frames_fine = extract_frames_at_fps(query_clip_path, FINE_FPS)
     query_frames_only = [f for f, _ in query_frames_fine]
 
     if not query_frames_only:
         logger.error("Fine search: no query frames extracted from '%s'", query_clip_path)
         return None
 
-    overall_best: tuple[float, float] | None = None
+    overall_best: tuple[float, float, str] | None = None
     absolute_best_score = 0.0
 
-    # Determine unique time windows to search (merge overlapping windows)
-    timestamps = sorted({t for _, t in candidate_windows})
+    try:
+        video_duration_sec = get_video_duration_sec(video_path)
+    except IOError:
+        video_duration_sec = 0.0
 
-    for ts in timestamps:
-        start = max(0.0, ts - window_padding_sec)
-        end = ts + query_duration_sec + window_padding_sec
+    search_duration = max(query_duration_sec, FINE_SEARCH_WINDOW_SEC)
+    if video_duration_sec > 0:
+        search_duration = min(search_duration, video_duration_sec)
 
+    raw_windows = [
+        (
+            max(0.0, timestamp - window_padding_sec),
+            max(0.0, timestamp - window_padding_sec) + search_duration,
+        )
+        for _, timestamp in candidate_windows
+    ]
+    raw_windows.sort()
+    windows: list[tuple[float, float]] = []
+    for start, end in raw_windows:
+        if video_duration_sec > 0:
+            end = min(video_duration_sec, end)
+            start = min(start, end)
+        if windows and start <= windows[-1][1]:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+        else:
+            windows.append((start, end))
+
+    for start, end in windows:
         db_frames_fine = extract_frames_in_window(video_path, start, end, FINE_FPS)
         if not db_frames_fine:
             continue
 
-        scored = sliding_window_ncc(query_frames_only, db_frames_fine, step=1, method=method)
-        best = best_ncc_result(scored)
+        scored = sliding_window_ncc_oriented(
+            query_frames_only,
+            db_frames_fine,
+            step=1,
+            method=method,
+            mirror_matching=mirror_matching,
+            enable_patch_early_rejection=ENABLE_PATCH_EARLY_REJECTION,
+            patch_grid_size=PATCH_GRID_SIZE,
+            patch_score_threshold=PATCH_SCORE_THRESHOLD,
+            patch_min_pass_ratio=PATCH_MIN_PASS_RATIO,
+        )
+        best = max(scored, key=lambda item: item[0], default=None)
 
         if best:
             if best[0] > absolute_best_score:
@@ -247,10 +333,11 @@ def _fine_search(
                 if overall_best is None or best[0] > overall_best[0]:
                     overall_best = best
                     logger.info(
-                        "Fine hit: video='%s', ts=%.2fs, score=%.4f",
+                        "Fine hit: video='%s', ts=%.2fs, score=%.4f, orientation=%s",
                         video_path,
                         best[1],
                         best[0],
+                        best[2],
                     )
 
     if overall_best is None:
@@ -298,7 +385,13 @@ def match_query_clip_live(
     logger.info("Query clip: %d frames at %d FPS", len(query_frames_coarse), coarse_fps)
     query_frames_only = [f for f, _ in query_frames_coarse]
     n_query = len(query_frames_only)
-    query_duration_sec = n_query / coarse_fps
+    try:
+        query_duration_sec = get_video_duration_sec(query_clip_path)
+    except IOError:
+        query_duration_sec = (
+            query_frames_coarse[-1][1] - query_frames_coarse[0][1] + 1 / coarse_fps
+        )
+    query_frames_fine = extract_frames_at_fps(query_clip_path, FINE_FPS)
 
     best_per_video: dict[str, tuple[float, float]] = {}
     total_videos = len(db_video_paths)
@@ -333,17 +426,28 @@ def match_query_clip_live(
             logger.info("Coarse HIT: '%s' — %d windows above threshold %.2f", video_id, len(above_threshold), NCC_COARSE_THRESHOLD)
             
             logger.info("Starting fine search for candidate '%s'...", video_id)
-            fine_result = _fine_search(query_clip_path, video_path, above_threshold, query_duration_sec, method=method)
+            fine_result = _fine_search(
+                query_clip_path,
+                video_path,
+                above_threshold,
+                query_duration_sec,
+                method=method,
+                query_frames_fine=query_frames_fine,
+                mirror_matching=ENABLE_MIRROR_MATCHING,
+            )
             
             if fine_result:
-                fine_score, fine_ts = fine_result
+                fine_score, fine_ts, orientation = fine_result
                 logger.info("EARLY STOP MATCH FOUND: video='%s', timestamp=%.2fs, confidence=%.4f", video_id, fine_ts, fine_score)
                 return MatchResult(
                     matched=True,
                     video_id=video_id,
                     video_filename=Path(video_path).name,
                     timestamp_sec=fine_ts,
+                    start_timestamp_sec=fine_ts,
+                    end_timestamp_sec=fine_ts + query_duration_sec,
                     confidence=round(fine_score, 4),
+                    match_orientation=orientation,
                     coarse_scores=best_per_video,
                 )
         else:
@@ -376,9 +480,8 @@ def match_query_clip(
     """
     logger.info("Starting coarse search for query: %s", query_clip_path)
 
-    query_frames_coarse = [
-        f for f, _ in extract_frames_at_fps(query_clip_path, COARSE_FPS)
-    ]
+    query_frames_with_ts = extract_frames_at_fps(query_clip_path, COARSE_FPS)
+    query_frames_coarse = [f for f, _ in query_frames_with_ts]
 
     if not query_frames_coarse:
         logger.error("No frames extracted from query clip '%s'", query_clip_path)
@@ -392,7 +495,15 @@ def match_query_clip(
 
     logger.info("Starting fine search over %d candidate video(s).", len(candidates))
 
-    overall_best: tuple[float, float, str] | None = None
+    try:
+        query_duration_sec = get_video_duration_sec(query_clip_path)
+    except IOError:
+        query_duration_sec = (
+            query_frames_with_ts[-1][1] - query_frames_with_ts[0][1] + 1 / COARSE_FPS
+        )
+    query_frames_fine = extract_frames_at_fps(query_clip_path, FINE_FPS)
+
+    overall_best: tuple[float, float, str, str] | None = None
 
     for video_id, candidate_windows in candidates.items():
         video_path = db_video_paths.get(video_id)
@@ -400,15 +511,22 @@ def match_query_clip(
             logger.warning("No video file path registered for video_id='%s'", video_id)
             continue
 
-        fine_result = _fine_search(query_clip_path, video_path, candidate_windows)
+        fine_result = _fine_search(
+            query_clip_path,
+            video_path,
+            candidate_windows,
+            query_duration_sec,
+            query_frames_fine=query_frames_fine,
+            mirror_matching=ENABLE_MIRROR_MATCHING,
+        )
 
         if fine_result:
-            score, ts = fine_result
+            score, ts, orientation = fine_result
             if overall_best is None or score > overall_best[0]:
-                overall_best = (score, ts, video_id)
+                overall_best = (score, ts, video_id, orientation)
 
     if overall_best:
-        best_score, best_ts, best_vid = overall_best
+        best_score, best_ts, best_vid, orientation = overall_best
         logger.info(
             "Match found: video='%s', timestamp=%.2fs, confidence=%.4f",
             best_vid, best_ts, best_score,
@@ -417,7 +535,10 @@ def match_query_clip(
             matched=True,
             video_id=best_vid,
             timestamp_sec=best_ts,
+            start_timestamp_sec=best_ts,
+            end_timestamp_sec=best_ts + query_duration_sec,
             confidence=round(best_score, 4),
+            match_orientation=orientation,
         )
 
     logger.info("Fine search: no match above threshold.")

@@ -14,8 +14,11 @@ from config import (
     COARSE_FPS,
     FINE_FPS,
     DB_VIDEOS_DIR,
+    ENABLE_MIRROR_MATCHING,
+    FINE_SEARCH_WINDOW_SEC,
     NCC_COARSE_THRESHOLD,
     NCC_FINE_THRESHOLD,
+    WINDOW_PADDING_SEC,
     ensure_directories,
 )
 from services.matcher import match_query_clip_live
@@ -59,6 +62,9 @@ def main():
     print(f"  Fine FPS         : {FINE_FPS}")
     print(f"  Coarse Threshold : {NCC_COARSE_THRESHOLD}")
     print(f"  Fine Threshold   : {NCC_FINE_THRESHOLD}")
+    print(f"  Fine Search Window: {FINE_SEARCH_WINDOW_SEC:.1f}s")
+    print(f"  Window Padding   : {WINDOW_PADDING_SEC:.1f}s")
+    print(f"  Mirror Matching  : {ENABLE_MIRROR_MATCHING}")
     print(f"  DB Videos Dir    : {DB_VIDEOS_DIR.resolve()}")
     print("=" * 60)
 
@@ -107,7 +113,16 @@ def main():
         print("  MATCH FOUND!")
         print(f"  Video ID   : {result.video_id}")
         print(f"  File Name  : {result.video_filename}")
-        print(f"  Timestamp  : {result.timestamp_str} (at {result.timestamp_sec:.2f}s)")
+        print(
+            f"  Start      : {result.start_timestamp_str} "
+            f"(at {result.start_timestamp_sec:.2f}s)"
+        )
+        print(
+            f"  End        : {result.end_timestamp_str} "
+            f"(at {result.end_timestamp_sec:.2f}s)"
+        )
+        print(f"  Orientation: {result.match_orientation}")
+        print(f"  Timestamp  : {result.timestamp_str} (legacy start alias)")
         print(f"  Confidence : {result.confidence:.4f}")
     else:
         print("  NO MATCH FOUND (above fine threshold)")

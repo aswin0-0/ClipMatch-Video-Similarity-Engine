@@ -110,7 +110,12 @@ def _format_response(result: MatchResult) -> JSONResponse:
                 "status": "match_found",
                 "video_id": result.video_id,
                 "timestamp": result.timestamp_str,
+                "start_timestamp": result.start_timestamp_str,
+                "end_timestamp": result.end_timestamp_str,
+                "start_timestamp_sec": result.start_timestamp_sec,
+                "end_timestamp_sec": result.end_timestamp_sec,
                 "confidence": result.confidence,
+                "orientation": result.match_orientation,
             },
         )
     return JSONResponse(

@@ -64,7 +64,15 @@ NCC_FINE_THRESHOLD=0.60
 COARSE_FPS=1
 FINE_FPS=24
 FRAME_SIZE=256
+FINE_SEARCH_WINDOW_SEC=20
+WINDOW_PADDING_SEC=5
+ENABLE_MIRROR_MATCHING=false
+STORE_FINE_FRAMES=false
 ```
+
+Fine frames are extracted live during matching by default. Set
+`STORE_FINE_FRAMES=true` only if persisted fine-frame PNGs are required for
+offline analysis.
 
 ---
 

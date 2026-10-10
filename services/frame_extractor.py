@@ -44,6 +44,17 @@ def _open_capture(video_path: str | Path) -> cv2.VideoCapture:
     return cap
 
 
+def get_video_duration_sec(video_path: str | Path) -> float:
+    """Return the source duration in seconds using OpenCV metadata."""
+    cap = _open_capture(video_path)
+    try:
+        source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+        return frame_count / source_fps if source_fps > 0 else 0.0
+    finally:
+        cap.release()
+
+
 # ── Public frame-extraction API ───────────────────────────────────────────────
 
 def extract_frames_at_fps(
