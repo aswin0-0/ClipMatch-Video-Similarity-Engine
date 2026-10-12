@@ -20,6 +20,7 @@ from config import (
     NCC_FINE_THRESHOLD,
     WINDOW_PADDING_SEC,
     ensure_directories,
+    video_sort_key,
 )
 from services.matcher import match_query_clip_live
 
@@ -47,7 +48,7 @@ def discover_db_videos() -> dict[str, Path]:
         logger.error("DB_VIDEOS_DIR does not exist: %s", DB_VIDEOS_DIR.resolve())
         return mapping
 
-    for f in DB_VIDEOS_DIR.iterdir():
+    for f in sorted(DB_VIDEOS_DIR.iterdir(), key=video_sort_key):
         if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS:
             mapping[f.stem] = f
 

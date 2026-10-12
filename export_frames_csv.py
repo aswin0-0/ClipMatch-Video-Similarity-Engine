@@ -9,10 +9,12 @@ from config import (
     FINE_FPS,
     NCC_COARSE_THRESHOLD,
     NCC_FINE_THRESHOLD,
-    STORE_FINE_FRAMES,
+    PROCESSED_FRAMES_DIR,
+    video_sort_key,
 )
 
-output_file = Path("database_videos_metadata.csv")
+coarse_output_file = Path("database_videos_coarse_metadata.csv")
+fine_output_file = Path("database_videos_fine_metadata.csv")
 video_extensions = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".flv"}
 
 fieldnames = [
@@ -32,11 +34,21 @@ fieldnames = [
     "threshold",
 ]
 
-with output_file.open("w", newline="", encoding="utf-8") as csv_file:
-    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-    writer.writeheader()
+def has_stored_frames(video_id: str, storage_fps: int) -> bool:
+    frame_dir = PROCESSED_FRAMES_DIR / video_id / f"{storage_fps}fps"
+    return any(frame_dir.glob("frame_*.png"))
 
-    for video_path in sorted(DB_VIDEOS_DIR.iterdir()):
+
+with (
+    coarse_output_file.open("w", newline="", encoding="utf-8") as coarse_csv,
+    fine_output_file.open("w", newline="", encoding="utf-8") as fine_csv,
+):
+    coarse_writer = csv.DictWriter(coarse_csv, fieldnames=fieldnames)
+    fine_writer = csv.DictWriter(fine_csv, fieldnames=fieldnames)
+    coarse_writer.writeheader()
+    fine_writer.writeheader()
+
+    for video_path in sorted(DB_VIDEOS_DIR.iterdir(), key=video_sort_key):
         if not video_path.is_file() or video_path.suffix.lower() not in video_extensions:
             continue
 
@@ -64,23 +76,24 @@ with output_file.open("w", newline="", encoding="utf-8") as csv_file:
             "duration_seconds": duration_seconds,
         }
 
-        writer.writerow(
+        coarse_writer.writerow(
             {
                 **common_metadata,
                 "storage_fps": COARSE_FPS,
                 "extraction_type": "coarse",
-                "persisted": True,
+                "persisted": has_stored_frames(video_path.stem, COARSE_FPS),
                 "threshold": NCC_COARSE_THRESHOLD,
             }
         )
-        writer.writerow(
+        fine_writer.writerow(
             {
                 **common_metadata,
                 "storage_fps": FINE_FPS,
                 "extraction_type": "fine",
-                "persisted": STORE_FINE_FRAMES,
+                "persisted": has_stored_frames(video_path.stem, FINE_FPS),
                 "threshold": NCC_FINE_THRESHOLD,
             }
         )
 
-print(f"Created: {output_file.resolve()}")
+print(f"Created: {coarse_output_file.resolve()}")
+print(f"Created: {fine_output_file.resolve()}")

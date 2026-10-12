@@ -9,7 +9,7 @@ The system is designed to be highly accurate while minimizing unnecessary comput
 ### 1. Ingestion (Offline)
 Before matching, the reference videos in your database must be ingested.
 - The `ingest.py` script scans the `db_videos/` directory.
-- It extracts frames at two rates: **Coarse (1 FPS)** and **Fine (24 FPS)**.
+- It extracts frames at two rates: **Coarse (1 FPS)** and **Fine (32 FPS)**.
 - Frames are preprocessed (grayscale, resized to 256x256, normalized) and saved as PNGs.
 - Metadata (video ID, timestamp, frame paths) is pushed to a **MongoDB** database.
 
@@ -22,7 +22,7 @@ When a query clip is provided, the matching pipeline runs a **Two-Pass NCC** alg
   - Windows of time that score above `NCC_COARSE_THRESHOLD` are flagged as candidates.
 
 - **Pass 2: Fine Search**
-  - For candidate windows found in Pass 1, the system extracts frames at 24 FPS from both the query clip and the localized 5-second window of the reference video.
+  - For candidate windows found in Pass 1, the system extracts frames at 32 FPS from both the query clip and the localized window of the reference video.
   - A full 256x256 sliding-window NCC is performed.
   - The window with the highest score above `NCC_FINE_THRESHOLD` is returned as the exact match.
 
@@ -62,7 +62,7 @@ QUERY_UPLOAD_DIR=./tmp/queries
 NCC_COARSE_THRESHOLD=0.45
 NCC_FINE_THRESHOLD=0.60
 COARSE_FPS=1
-FINE_FPS=24
+FINE_FPS=32
 FRAME_SIZE=256
 FINE_SEARCH_WINDOW_SEC=20
 WINDOW_PADDING_SEC=5

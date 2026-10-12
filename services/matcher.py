@@ -40,10 +40,12 @@ from config import (
     PATCH_MIN_PASS_RATIO,
     PATCH_SCORE_THRESHOLD,
     WINDOW_PADDING_SEC,
+    video_sort_key,
 )
 from services.frame_extractor import (
     extract_frames_at_fps,
     extract_frames_in_window,
+    extract_stored_frames_at_fps,
     get_video_duration_sec,
     load_frame_from_disk,
 )
@@ -109,6 +111,7 @@ def _coarse_search_live(
     db_video_paths: dict[str, str | Path],
     coarse_fps: int = 1,
     method: str = "standard",
+    stop_on_first_hit: bool = False,
 ) -> tuple[dict[str, list[tuple[float, float]]], dict[str, tuple[float, float]]]:
     """
     Live coarse search: extract frames from each DB video at coarse_fps
@@ -122,6 +125,7 @@ def _coarse_search_live(
         db_video_paths: Mapping of video_id → path to video file.
         coarse_fps: FPS to extract DB frames at (default: 1).
         method:     'standard' or 'diagonal'.
+        stop_on_first_hit: Stop after the first video crosses the coarse threshold.
 
     Returns:
         Tuple of:
@@ -136,17 +140,27 @@ def _coarse_search_live(
 
     total_videos = len(db_video_paths)
 
-    for idx, (video_id, video_path) in enumerate(db_video_paths.items(), 1):
+    ordered_video_paths = sorted(
+        db_video_paths.items(),
+        key=lambda item: video_sort_key(item[0]),
+    )
+
+    for idx, (video_id, video_path) in enumerate(ordered_video_paths, 1):
         logger.info(
             "Coarse [%d/%d]: extracting frames from '%s' @ %d FPS...",
             idx, total_videos, video_id, coarse_fps,
         )
 
         try:
-            db_frames = extract_frames_at_fps(video_path, coarse_fps)
-        except IOError as exc:
-            logger.warning("Cannot open '%s': %s", video_path, exc)
-            continue
+            db_frames = extract_stored_frames_at_fps(video_id, video_path, coarse_fps)
+            logger.info("Coarse [%d/%d]: using stored frames for '%s'.", idx, total_videos, video_id)
+        except (FileNotFoundError, IOError) as exc:
+            logger.info("Stored coarse frames unavailable for '%s' (%s); extracting live.", video_id, exc)
+            try:
+                db_frames = extract_frames_at_fps(video_path, coarse_fps)
+            except IOError as live_exc:
+                logger.warning("Cannot open '%s': %s", video_path, live_exc)
+                continue
 
         if len(db_frames) < n_query:
             logger.info(
@@ -186,6 +200,8 @@ def _coarse_search_live(
                     "Coarse HIT: '%s' — %d windows above threshold %.2f",
                     video_id, len(above_threshold), NCC_COARSE_THRESHOLD,
                 )
+                if stop_on_first_hit:
+                    break
         else:
             logger.info(
                 "Coarse [%d/%d]: '%s' -> no valid windows.",
@@ -252,6 +268,7 @@ def _fine_search(
     method: str = "standard",
     query_frames_fine: list[tuple[np.ndarray, float]] | None = None,
     mirror_matching: bool = ENABLE_MIRROR_MATCHING,
+    enable_patch_early_rejection: bool = ENABLE_PATCH_EARLY_REJECTION,
 ) -> tuple[float, float, str] | None:
     """
     Perform high-FPS NCC over the localized candidate windows.
@@ -318,7 +335,7 @@ def _fine_search(
             step=1,
             method=method,
             mirror_matching=mirror_matching,
-            enable_patch_early_rejection=ENABLE_PATCH_EARLY_REJECTION,
+            enable_patch_early_rejection=enable_patch_early_rejection,
             patch_grid_size=PATCH_GRID_SIZE,
             patch_score_threshold=PATCH_SCORE_THRESHOLD,
             patch_min_pass_ratio=PATCH_MIN_PASS_RATIO,
@@ -375,7 +392,7 @@ def match_query_clip_live(
     Returns:
         MatchResult with diagnostics.
     """
-    logger.info("Starting LIVE search (early stopping enabled) for query: %s", query_clip_path)
+    logger.info("Starting LIVE two-pass search for query: %s", query_clip_path)
 
     query_frames_coarse = extract_frames_at_fps(query_clip_path, coarse_fps)
     if not query_frames_coarse:
@@ -383,77 +400,66 @@ def match_query_clip_live(
         return MatchResult(matched=False)
 
     logger.info("Query clip: %d frames at %d FPS", len(query_frames_coarse), coarse_fps)
-    query_frames_only = [f for f, _ in query_frames_coarse]
-    n_query = len(query_frames_only)
     try:
         query_duration_sec = get_video_duration_sec(query_clip_path)
     except IOError:
         query_duration_sec = (
             query_frames_coarse[-1][1] - query_frames_coarse[0][1] + 1 / coarse_fps
         )
+    candidates, best_per_video = _coarse_search_live(
+        query_frames_coarse,
+        db_video_paths,
+        coarse_fps=coarse_fps,
+        method=method,
+        stop_on_first_hit=True,
+    )
+
+    if not candidates:
+        logger.info("Coarse search: no candidates found.")
+        return MatchResult(matched=False, coarse_scores=best_per_video)
+
     query_frames_fine = extract_frames_at_fps(query_clip_path, FINE_FPS)
+    logger.info("Starting fine search over %d coarse candidate(s) at %d FPS.", len(candidates), FINE_FPS)
 
-    best_per_video: dict[str, tuple[float, float]] = {}
-    total_videos = len(db_video_paths)
+    video_id, candidate_windows = next(iter(candidates.items()))
+    video_path = db_video_paths.get(video_id)
+    if not video_path:
+        logger.warning("No video file path registered for video_id='%s'", video_id)
+        return MatchResult(matched=False, coarse_scores=best_per_video)
 
-    for idx, (video_id, video_path) in enumerate(db_video_paths.items(), 1):
+    logger.info("Starting fine search for the coarse-hit video '%s' at %d FPS...", video_id, FINE_FPS)
+    fine_result = _fine_search(
+        query_clip_path,
+        video_path,
+        candidate_windows,
+        query_duration_sec,
+        method=method,
+        query_frames_fine=query_frames_fine,
+        mirror_matching=ENABLE_MIRROR_MATCHING,
+        enable_patch_early_rejection=False,
+    )
+
+    if fine_result:
+        fine_score, fine_ts, orientation = fine_result
         logger.info(
-            "Coarse [%d/%d]: extracting frames from '%s' @ %d FPS...",
-            idx, total_videos, video_id, coarse_fps,
+            "Fine match found: video='%s', timestamp=%.2fs, confidence=%.4f",
+            video_id,
+            fine_ts,
+            fine_score,
+        )
+        return MatchResult(
+            matched=True,
+            video_id=video_id,
+            video_filename=Path(video_path).name,
+            timestamp_sec=fine_ts,
+            start_timestamp_sec=fine_ts,
+            end_timestamp_sec=fine_ts + query_duration_sec,
+            confidence=round(fine_score, 4),
+            match_orientation=orientation,
+            coarse_scores=best_per_video,
         )
 
-        try:
-            db_frames = extract_frames_at_fps(video_path, coarse_fps)
-        except IOError as exc:
-            logger.warning("Cannot open '%s': %s", video_path, exc)
-            continue
-
-        if len(db_frames) < n_query:
-            logger.info("Coarse [%d/%d]: '%s' has only %d frames. Skipping.", idx, total_videos, video_id, len(db_frames))
-            continue
-
-        logger.info("Coarse [%d/%d]: comparing %d query vs %d DB frames (method=%s)...", idx, total_videos, n_query, len(db_frames), method)
-        scored = sliding_window_ncc(query_frames_only, db_frames, step=1, method=method)
-
-        if not scored:
-            continue
-
-        best_score, best_ts = max(scored, key=lambda x: x[0])
-        best_per_video[video_id] = (best_score, best_ts)
-        
-        above_threshold = [(s, t) for s, t in scored if s >= NCC_COARSE_THRESHOLD]
-        if above_threshold:
-            logger.info("Coarse HIT: '%s' — %d windows above threshold %.2f", video_id, len(above_threshold), NCC_COARSE_THRESHOLD)
-            
-            logger.info("Starting fine search for candidate '%s'...", video_id)
-            fine_result = _fine_search(
-                query_clip_path,
-                video_path,
-                above_threshold,
-                query_duration_sec,
-                method=method,
-                query_frames_fine=query_frames_fine,
-                mirror_matching=ENABLE_MIRROR_MATCHING,
-            )
-            
-            if fine_result:
-                fine_score, fine_ts, orientation = fine_result
-                logger.info("EARLY STOP MATCH FOUND: video='%s', timestamp=%.2fs, confidence=%.4f", video_id, fine_ts, fine_score)
-                return MatchResult(
-                    matched=True,
-                    video_id=video_id,
-                    video_filename=Path(video_path).name,
-                    timestamp_sec=fine_ts,
-                    start_timestamp_sec=fine_ts,
-                    end_timestamp_sec=fine_ts + query_duration_sec,
-                    confidence=round(fine_score, 4),
-                    match_orientation=orientation,
-                    coarse_scores=best_per_video,
-                )
-        else:
-            logger.info("Coarse miss: '%s' best NCC = %.4f", video_id, best_score)
-
-    logger.info("Search complete: no match found across all %d videos.", total_videos)
+    logger.info("Fine search: no match above threshold for coarse-hit video '%s'.", video_id)
     return MatchResult(matched=False, coarse_scores=best_per_video)
 
 

@@ -44,6 +44,7 @@ from config import (
     PROCESSED_FRAMES_DIR,
     STORE_FINE_FRAMES,
     ensure_directories,
+    video_sort_key,
 )
 
 logging.basicConfig(
@@ -187,7 +188,7 @@ def ingest(videos_dir: Path, force: bool = False) -> None:
 
     total_frames = 0
 
-    for video_path in sorted(video_files):
+    for video_path in sorted(video_files, key=video_sort_key):
         video_id = video_path.stem  # e.g. "vid_042" from "vid_042.mp4"
 
         # ── Skip if already ingested (unless --force) ─────────────────────────

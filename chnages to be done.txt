@@ -1,0 +1,257 @@
+You are working on the ClipMatch-Video-Similarity-Engine Python project.
+
+Improve the video search pipeline so it remains accurate but scales from 25 videos to at least 200 videos.
+
+Current behavior:
+- The project uses two-pass NCC matching.
+- Coarse matching scans database videos at low FPS.
+- Fine matching runs at higher FPS around candidate timestamps.
+- Query and database frames are converted to grayscale and resized to 256x256.
+- The CLI uses match_query_clip_live().
+- The FastAPI endpoint uses match_query_clip().
+- Current search takes approximately 6 minutes for 25 videos.
+- At the current scaling rate, 200 videos could take approximately 48 minutes.
+- The project must continue using NCC for final verification.
+
+Implement the following changes.
+
+1. Fix the current coarse-search implementation
+
+In services/matcher.py:
+
+- Ensure match_query_clip_live() passes all patch early-rejection settings to sliding_window_ncc().
+- The settings must include:
+  - enable_patch_early_rejection
+  - patch_grid_size
+  - patch_score_threshold
+  - patch_min_pass_ratio
+- Avoid duplicated coarse-search logic where possible.
+- Reuse _coarse_search_live() or extract a shared coarse-search helper so the CLI and API use consistent behavior.
+- Preserve the existing public function signatures where possible.
+
+2. Optimize coarse matching
+
+Add a separate configurable coarse-processing resolution.
+
+Configuration should include:
+
+COARSE_FRAME_SIZE=64
+COARSE_FPS=1
+COARSE_STEP=1
+
+The coarse stage should:
+
+- Use 64x64 grayscale frames or another clearly documented low resolution.
+- Use diagonal NCC or patch-based NCC for fast filtering.
+- Avoid full 256x256 NCC during the database-wide coarse scan.
+- Keep full 256x256 NCC for final fine verification.
+- Keep brightness robustness by using normalized, zero-mean comparison.
+- Do not compare raw pixel values directly.
+
+3. Reduce video decoding overhead
+
+Improve frame extraction in services/frame_extractor.py:
+
+- Avoid decoding unnecessary frames where possible.
+- Use OpenCV grab() or an equivalent approach to skip frames that are not needed.
+- Preserve accurate timestamps.
+- Avoid loading an entire long video into memory when a bounded iterator or generator is sufficient.
+- Do not break existing frame extraction behavior used by the API and CLI.
+
+4. Add candidate ranking
+
+During the coarse stage:
+
+- Store the best coarse score and timestamp for every video.
+- Rank database videos by coarse score.
+- Limit fine matching to a configurable number of candidates.
+
+Add configuration:
+
+MAX_FINE_CANDIDATES=5
+
+Only the top candidates should normally proceed to fine matching. Preserve a configuration option to disable this limit for debugging.
+
+5. Optimize fine search
+
+Keep the two-pass architecture.
+
+For fine matching:
+
+- Search only around candidate timestamps.
+- Use a configurable maximum fine-search window:
+  FINE_SEARCH_WINDOW_SEC=20
+- Use:
+  WINDOW_PADDING_SEC=5
+- Clamp search windows to the actual database video duration.
+- Merge overlapping candidate windows.
+- Cache fine query frames once per request.
+- Do not extract fine query frames repeatedly for every database video.
+- Do not permanently store fine PNG frames unless STORE_FINE_FRAMES=true.
+- Keep full-frame NCC as the final verification stage.
+
+6. Add optional fast candidate signatures
+
+Implement an optional coarse signature index for scaling beyond 25 videos.
+
+The signature index should:
+
+- Be generated during ingestion or by a separate indexing command.
+- Sample low-FPS grayscale frames.
+- Store a compact signature and timestamp for each sampled frame.
+- Support one of the following:
+  - perceptual hash
+  - compact low-resolution vector
+  - another lightweight visual signature
+- Use the signature only to select candidate videos and timestamps.
+- Never use the signature as the final match decision.
+- Use NCC for final verification.
+- Support brightness changes as much as practical.
+- Document mirror limitations clearly.
+- Do not add a large machine-learning dependency unless necessary.
+
+If a perceptual hash is used, make it optional and configurable:
+
+ENABLE_SIGNATURE_INDEX=false
+
+7. Add optional parallel processing
+
+Add safe parallelism for independent database videos:
+
+- Use ProcessPoolExecutor or another appropriate process-based approach for CPU-bound work.
+- Do not create an excessive number of workers.
+- Add configuration:
+
+MAX_WORKERS=4
+
+- Ensure errors in one video do not stop matching for all other videos.
+- Preserve deterministic ranking and result selection.
+- Do not parallelize in a way that causes unbounded memory usage.
+
+8. Preserve timestamp correctness
+
+Keep the existing MatchResult compatibility fields:
+
+- timestamp_sec
+- timestamp_str
+
+Add or preserve:
+
+- start_timestamp_sec
+- end_timestamp_sec
+- start_timestamp_str
+- end_timestamp_str
+
+Define:
+
+end_timestamp_sec = start_timestamp_sec + query_duration_sec
+
+The existing timestamp field must remain an alias for the start timestamp.
+
+Return start and end timestamps from both:
+
+- CLI output
+- FastAPI JSON response
+
+9. Preserve mirror and brightness behavior
+
+- Keep ENABLE_MIRROR_MATCHING=false by default.
+- When enabled, compare normal and horizontally flipped variants.
+- Return the selected orientation.
+- Keep zero-mean NCC for brightness and positive contrast robustness.
+- Do not assume diagonal NCC is mirror-invariant.
+
+10. Add diagnostics and benchmarking
+
+Add clear logs for:
+
+- Query frame extraction time
+- Coarse extraction time per video
+- Coarse comparison time per video
+- Number of coarse candidates
+- Number of fine candidates
+- Fine matching time
+- Total matching time
+- Number of windows rejected by patch filtering
+- Number of full NCC comparisons performed
+
+Add a benchmark or diagnostic command that compares:
+
+- Current full coarse NCC
+- Diagonal coarse NCC
+- Patch-based coarse rejection
+- Signature-index candidate filtering, if enabled
+
+Report:
+
+- Total execution time
+- Number of database videos scanned
+- Number of fine candidates
+- Final confidence
+- Final start and end timestamps
+
+11. Add tests
+
+Add focused tests for:
+
+- Patch settings being used by match_query_clip_live().
+- Coarse candidate ranking.
+- MAX_FINE_CANDIDATES.
+- Correct start and end timestamps.
+- Query duration calculation.
+- Fine window clamping.
+- Fine window maximum duration.
+- Overlapping window merging.
+- Brightness-shifted frames.
+- Mirrored matching enabled and disabled.
+- Diagonal mode compatibility.
+- Signature filtering, if implemented.
+- Bounded frame extraction.
+- API response compatibility.
+- CLI output compatibility.
+- Worker failure isolation if parallel processing is added.
+
+12. Validation
+
+Run:
+
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+
+.venv\Scripts\python.exe verify_imports.py
+
+Also run:
+
+- A CLI smoke test with a real query video.
+- A FastAPI import/startup check.
+- A benchmark with the existing database videos.
+- A no-match query test.
+- A known-match query test.
+- A brightness-modified query test.
+- A mirrored query test when mirror matching is enabled.
+
+13. Files that may need modification
+
+- config.py
+- services/matcher.py
+- services/ncc.py
+- services/frame_extractor.py
+- routers/match.py
+- cli.py
+- ingest.py
+- README.md
+- requirements.txt only if a dependency is truly necessary
+- tests/test_matching_features.py
+- Add a separate indexing or benchmark module if appropriate.
+
+Constraints:
+
+- Do not modify MongoDB credentials.
+- Do not commit changes.
+- Do not push changes.
+- Do not remove the current NCC final verification.
+- Do not silently change existing thresholds.
+- Do not break the current CLI or FastAPI APIs.
+- Do not add unnecessary dependencies.
+- Avoid storing machine-specific absolute paths in generated files.
+- Prefer small, testable changes.
+- Report all changed files, tests run, benchmark results, and remaining limitations.

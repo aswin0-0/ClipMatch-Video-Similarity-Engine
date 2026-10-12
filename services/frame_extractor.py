@@ -14,7 +14,7 @@ from typing import Generator
 import cv2
 import numpy as np
 
-from config import FRAME_SIZE
+from config import FRAME_SIZE, PROCESSED_FRAMES_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +104,39 @@ def extract_frames_at_fps(
         return frames
     finally:
         cap.release()
+
+
+def extract_stored_frames_at_fps(
+    video_id: str,
+    video_path: str | Path,
+    target_fps: int,
+) -> list[tuple[np.ndarray, float]]:
+    """Load preprocessed frames created by ingestion, preserving source timestamps."""
+    frame_dir = PROCESSED_FRAMES_DIR / video_id / f"{target_fps}fps"
+    frame_paths = sorted(
+        frame_dir.glob("frame_*.png"),
+        key=lambda path: int(path.stem.split("_")[-1]),
+    )
+    if not frame_paths:
+        raise FileNotFoundError(f"No stored {target_fps} FPS frames found for '{video_id}'")
+
+    cap = _open_capture(video_path)
+    try:
+        source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+    finally:
+        cap.release()
+
+    frames = [
+        (load_frame_from_disk(path), int(path.stem.split("_")[-1]) / source_fps)
+        for path in frame_paths
+    ]
+    logger.debug(
+        "Loaded %d stored frames for '%s' @ %d FPS",
+        len(frames),
+        video_id,
+        target_fps,
+    )
+    return frames
 
 
 def extract_frames_in_window(

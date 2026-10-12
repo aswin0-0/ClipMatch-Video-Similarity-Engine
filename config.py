@@ -4,6 +4,7 @@ All environment variables are parsed here and exposed as typed constants.
 """
 
 import os
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -23,7 +24,7 @@ QUERY_UPLOAD_DIR: Path = Path(os.getenv("QUERY_UPLOAD_DIR", "./tmp/queries"))
 
 # ── NCC matching thresholds ───────────────────────────────────────────────────
 NCC_COARSE_THRESHOLD: float = float(os.getenv("NCC_COARSE_THRESHOLD", "0.75"))
-NCC_FINE_THRESHOLD: float = float(os.getenv("NCC_FINE_THRESHOLD", "0.85"))
+NCC_FINE_THRESHOLD: float = float(os.getenv("NCC_FINE_THRESHOLD", "0.60"))
 
 # ── Matching optimization settings ──────────────────────────────────────────
 FINE_SEARCH_WINDOW_SEC: float = float(os.getenv("FINE_SEARCH_WINDOW_SEC", "20"))
@@ -43,7 +44,7 @@ PATCH_MIN_PASS_RATIO: float = float(os.getenv("PATCH_MIN_PASS_RATIO", "0.50"))
 
 # ── Frame extraction settings ─────────────────────────────────────────────────
 COARSE_FPS: int = int(os.getenv("COARSE_FPS", "1"))
-FINE_FPS: int = int(os.getenv("FINE_FPS", "24"))
+FINE_FPS: int = int(os.getenv("FINE_FPS", "32"))
 FRAME_SIZE: int = int(os.getenv("FRAME_SIZE", "256"))
 STORE_FINE_FRAMES: bool = os.getenv("STORE_FINE_FRAMES", "false").lower() in {
     "1",
@@ -51,6 +52,13 @@ STORE_FINE_FRAMES: bool = os.getenv("STORE_FINE_FRAMES", "false").lower() in {
     "yes",
     "on",
 }
+
+
+def video_sort_key(value: str | Path) -> tuple[int, str]:
+    """Sort numbered video names numerically with a stable name tie-breaker."""
+    name = Path(value).name
+    match = re.search(r"(\d+)", name)
+    return (int(match.group(1)) if match else 2**31 - 1, name.casefold())
 
 
 def ensure_directories() -> None:

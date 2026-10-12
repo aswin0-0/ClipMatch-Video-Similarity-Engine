@@ -60,10 +60,31 @@ def patch_pass_ratio(
     frame_b: np.ndarray,
     grid_size: int = 4,
     threshold: float = 0.20,
+    method: str = "standard",
 ) -> float:
-    """Return the fraction of grid patches whose NCC reaches *threshold*."""
+    """Return the fraction of patches whose selected NCC reaches *threshold*."""
     if grid_size <= 0 or frame_a.shape != frame_b.shape:
         return 0.0
+
+    if method == "diagonal":
+        diagonal_a = np.diag(frame_a).astype(np.float64)
+        diagonal_b = np.diag(frame_b).astype(np.float64)
+        usable_length = (len(diagonal_a) // grid_size) * grid_size
+        if usable_length == 0:
+            return 0.0
+
+        patches_a = diagonal_a[:usable_length].reshape(grid_size, -1)
+        patches_b = diagonal_b[:usable_length].reshape(grid_size, -1)
+        patches_a -= patches_a.mean(axis=1, keepdims=True)
+        patches_b -= patches_b.mean(axis=1, keepdims=True)
+        norms = np.linalg.norm(patches_a, axis=1) * np.linalg.norm(patches_b, axis=1)
+        scores = np.divide(
+            np.sum(patches_a * patches_b, axis=1),
+            norms,
+            out=np.zeros_like(norms),
+            where=norms >= 1e-8,
+        )
+        return float(np.mean(np.maximum(0.0, scores) >= threshold))
 
     height, width = frame_a.shape[:2]
     row_edges = np.linspace(0, height, grid_size + 1, dtype=int)
@@ -78,7 +99,7 @@ def patch_pass_ratio(
             if patch_a.size == 0 or patch_b.size == 0:
                 continue
             total += 1
-            passed += ncc_score(patch_a, patch_b) >= threshold
+            passed += ncc_score(patch_a, patch_b, method=method) >= threshold
 
     return passed / total if total else 0.0
 
@@ -97,13 +118,14 @@ def _sequence_score(
     if n_pairs == 0:
         return None
 
-    if enable_patch_early_rejection and method == "standard":
+    if enable_patch_early_rejection:
         patch_ratios = [
             patch_pass_ratio(
                 query_frames[index],
                 db_frames[index],
                 grid_size=patch_grid_size,
                 threshold=patch_score_threshold,
+                method=method,
             )
             for index in range(n_pairs)
         ]
