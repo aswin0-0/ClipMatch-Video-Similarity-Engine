@@ -1,0 +1,3 @@
+query_file,true_video_id,true_start_sec,true_end_sec,predicted_video_id,predicted_timestamp_sec,coarse_ncc_score,fine_ncc_score,orientation,elapsed_seconds
+Query_Video12 (4_10-4_24).mp4,Query_Video12,250.00,264.00,Query_Video12,250.02,0.9422,0.9991,normal,97.55
+query-video122(56_00-1_06).mp4,Query_Video122,3360.00,66.00,Query_Video122,56.73,0.8853,0.9795,normal,90.24

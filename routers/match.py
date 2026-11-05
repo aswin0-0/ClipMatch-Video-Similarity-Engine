@@ -59,7 +59,14 @@ async def _fetch_coarse_docs() -> list[dict]:
     db = get_database()
     cursor = db["frames"].find(
         {"fps": COARSE_FPS},
-        {"_id": 0, "video_id": 1, "frame_path": 1, "timestamp_sec": 1, "fps": 1},
+        {
+            "_id": 0,
+            "video_id": 1,
+            "frame_data": 1,
+            "frame_path": 1,
+            "timestamp_sec": 1,
+            "fps": 1,
+        },
     )
     return await cursor.to_list(length=None)
 

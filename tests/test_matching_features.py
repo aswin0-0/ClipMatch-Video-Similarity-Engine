@@ -75,6 +75,31 @@ class MatchingFeaturesTests(unittest.TestCase):
         self.assertLessEqual(end - start, 20.0)
         self.assertEqual(result[2], "normal")
 
+    def test_load_frame_from_bytes_and_coarse_search(self):
+        import cv2
+        from services.frame_extractor import load_frame_from_bytes
+        from services.matcher import _coarse_search
+
+        # Create a synthetic 256x256 uint8 image
+        raw_uint8 = (self.frame * 255.0).astype(np.uint8)
+        ok, buf = cv2.imencode(".png", raw_uint8)
+        self.assertTrue(ok)
+        frame_bytes = buf.tobytes()
+
+        # Test decoding from bytes
+        decoded = load_frame_from_bytes(frame_bytes)
+        self.assertEqual(decoded.shape, (256, 256))
+        self.assertAlmostEqual(float(decoded[0, 0]), float(self.frame[0, 0]), places=2)
+
+        # Test _coarse_search using frame_data directly from doc
+        docs = [
+            {"video_id": "test_vid", "frame_data": frame_bytes, "timestamp_sec": 0.0, "fps": 1},
+            {"video_id": "test_vid", "frame_data": frame_bytes, "timestamp_sec": 1.0, "fps": 1},
+        ]
+        candidates = _coarse_search([self.frame], docs)
+        self.assertIn("test_vid", candidates)
+        self.assertGreater(candidates["test_vid"][0][0], 0.99)
+
 
 if __name__ == "__main__":
     unittest.main()

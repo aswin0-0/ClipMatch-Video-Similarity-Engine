@@ -223,3 +223,72 @@ def load_frame_from_disk(frame_path: str | Path) -> np.ndarray:
         raise IOError(f"Cannot decode frame image: {p}")
 
     return img.astype(np.float32) / 255.0
+
+
+
+def load_frame_from_bytes(frame_bytes: bytes) -> np.ndarray:
+    """
+    Decode a preprocessed frame stored as binary image data in MongoDB.
+
+    Args:
+        frame_bytes: PNG-encoded binary image bytes.
+
+    Returns:
+        Normalized float32 ndarray of shape (FRAME_SIZE, FRAME_SIZE).
+
+    Raises:
+        IOError: If OpenCV cannot decode the image buffer.
+    """
+    buf = np.frombuffer(frame_bytes, dtype=np.uint8)
+    img = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise IOError("Cannot decode frame from binary data.")
+
+    return img.astype(np.float32) / 255.0
+
+
+def extract_stored_frames_from_db(
+    video_id: str,
+    target_fps: int,
+) -> list[tuple[np.ndarray, float]]:
+    """
+    Fetch preprocessed frames directly from MongoDB for a given video_id and FPS.
+    Decodes the binary 'frame_data' stored during ingestion.
+
+    Args:
+        video_id:   Video identifier.
+        target_fps: Extraction rate (e.g. COARSE_FPS).
+
+    Returns:
+        List of (frame_array, timestamp_sec).
+
+    Raises:
+        FileNotFoundError: If no documents with frame_data are found for the video.
+    """
+    import pymongo
+    from database import get_sync_database
+
+    db = get_sync_database()
+    cursor = db["frames"].find(
+        {"video_id": video_id, "fps": target_fps, "frame_data": {"$exists": True}},
+        {"_id": 0, "frame_data": 1, "timestamp_sec": 1},
+    ).sort("timestamp_sec", pymongo.ASCENDING)
+
+    docs = list(cursor)
+    if not docs:
+        raise FileNotFoundError(
+            f"No stored {target_fps} FPS frames found in MongoDB for '{video_id}'"
+        )
+
+    frames: list[tuple[np.ndarray, float]] = []
+    for doc in docs:
+        frame = load_frame_from_bytes(doc["frame_data"])
+        frames.append((frame, float(doc["timestamp_sec"])))
+
+    logger.debug(
+        "Loaded %d stored frames from MongoDB for '%s' @ %d FPS",
+        len(frames),
+        video_id,
+        target_fps,
+    )
+    return frames

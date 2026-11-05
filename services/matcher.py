@@ -46,7 +46,9 @@ from services.frame_extractor import (
     extract_frames_at_fps,
     extract_frames_in_window,
     extract_stored_frames_at_fps,
+    extract_stored_frames_from_db,
     get_video_duration_sec,
+    load_frame_from_bytes,
     load_frame_from_disk,
 )
 from services.ncc import best_ncc_result, sliding_window_ncc, sliding_window_ncc_oriented
@@ -152,15 +154,19 @@ def _coarse_search_live(
         )
 
         try:
-            db_frames = extract_stored_frames_at_fps(video_id, video_path, coarse_fps)
-            logger.info("Coarse [%d/%d]: using stored frames for '%s'.", idx, total_videos, video_id)
-        except (FileNotFoundError, IOError) as exc:
-            logger.info("Stored coarse frames unavailable for '%s' (%s); extracting live.", video_id, exc)
+            db_frames = extract_stored_frames_from_db(video_id, coarse_fps)
+            logger.info("Coarse [%d/%d]: using MongoDB stored frames for '%s'.", idx, total_videos, video_id)
+        except Exception:
             try:
-                db_frames = extract_frames_at_fps(video_path, coarse_fps)
-            except IOError as live_exc:
-                logger.warning("Cannot open '%s': %s", video_path, live_exc)
-                continue
+                db_frames = extract_stored_frames_at_fps(video_id, video_path, coarse_fps)
+                logger.info("Coarse [%d/%d]: using disk stored frames for '%s'.", idx, total_videos, video_id)
+            except (FileNotFoundError, IOError) as exc:
+                logger.info("Stored coarse frames unavailable for '%s' (%s); extracting live.", video_id, exc)
+                try:
+                    db_frames = extract_frames_at_fps(video_path, coarse_fps)
+                except IOError as live_exc:
+                    logger.warning("Cannot open '%s': %s", video_path, live_exc)
+                    continue
 
         if len(db_frames) < n_query:
             logger.info(
@@ -229,10 +235,15 @@ def _coarse_search(
 
     for doc in db_docs:
         try:
-            frame = load_frame_from_disk(doc["frame_path"])
+            if doc.get("frame_data"):
+                frame = load_frame_from_bytes(doc["frame_data"])
+            elif doc.get("frame_path"):
+                frame = load_frame_from_disk(doc["frame_path"])
+            else:
+                continue
             by_video[doc["video_id"]].append((frame, float(doc["timestamp_sec"])))
         except (FileNotFoundError, IOError) as exc:
-            logger.warning("Skipping frame '%s': %s", doc.get("frame_path"), exc)
+            logger.warning("Skipping frame for '%s': %s", doc.get("video_id"), exc)
 
     for vid in by_video:
         by_video[vid].sort(key=lambda x: x[1])
@@ -269,6 +280,7 @@ def _fine_search(
     query_frames_fine: list[tuple[np.ndarray, float]] | None = None,
     mirror_matching: bool = ENABLE_MIRROR_MATCHING,
     enable_patch_early_rejection: bool = ENABLE_PATCH_EARLY_REJECTION,
+    fine_threshold: float = NCC_FINE_THRESHOLD,
 ) -> tuple[float, float, str] | None:
     """
     Perform high-FPS NCC over the localized candidate windows.
@@ -346,7 +358,7 @@ def _fine_search(
             if best[0] > absolute_best_score:
                 absolute_best_score = best[0]
             
-            if best[0] >= NCC_FINE_THRESHOLD:
+            if best[0] >= fine_threshold:
                 if overall_best is None or best[0] > overall_best[0]:
                     overall_best = best
                     logger.info(
@@ -362,7 +374,7 @@ def _fine_search(
             "Fine miss: video='%s', best score was %.4f (threshold=%.2f)",
             video_path,
             absolute_best_score,
-            NCC_FINE_THRESHOLD,
+            fine_threshold,
         )
 
     return overall_best

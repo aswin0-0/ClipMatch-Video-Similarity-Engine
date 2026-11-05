@@ -121,19 +121,34 @@ def _ingest_video(
                 timestamp_sec = frame_index / source_fps
                 processed = _preprocess_frame(raw)
 
+                # Encode preprocessed frame to PNG binary in memory for MongoDB
+                success, buffer = cv2.imencode(".png", processed)
+                if not success:
+                    logger.error("Failed to encode frame at %.2fs to PNG", timestamp_sec)
+                    frame_index += 1
+                    continue
+                frame_bytes = buffer.tobytes()
+
                 frame_filename = f"frame_{frame_index:08d}.png"
                 frame_dest = frame_dir / frame_filename
 
-                if _save_frame(processed, frame_dest):
-                    docs.append(
-                        {
-                            "video_id": video_id,
-                            "frame_path": str(frame_dest.resolve()),
-                            "timestamp_sec": round(timestamp_sec, 4),
-                            "fps": target_fps,
-                        }
-                    )
-                    saved_count += 1
+                # Also save to disk for file-based fallback
+                _save_frame(processed, frame_dest)
+
+                docs.append(
+                    {
+                        "video_id": video_id,
+                        "frame_data": frame_bytes,
+                        "frame_path": str(frame_dest.resolve()),
+                        "timestamp_sec": round(timestamp_sec, 4),
+                        "fps": target_fps,
+                    }
+                )
+                saved_count += 1
+
+                if len(docs) >= 200:
+                    collection.insert_many(docs, ordered=False)
+                    docs.clear()
 
             frame_index += 1
     finally:
@@ -141,12 +156,14 @@ def _ingest_video(
 
     if docs:
         collection.insert_many(docs, ordered=False)
-        logger.info(
-            "  Inserted %d frame docs @ %d FPS for video_id='%s'",
-            len(docs),
-            target_fps,
-            video_id,
-        )
+        docs.clear()
+
+    logger.info(
+        "  Inserted %d frame docs (with binary frame_data) @ %d FPS for video_id='%s'",
+        saved_count,
+        target_fps,
+        video_id,
+    )
 
     return saved_count
 
@@ -171,6 +188,7 @@ def ingest(videos_dir: Path, force: bool = False) -> None:
     # Create indexes for efficient querying
     frames_col.create_index([("video_id", pymongo.ASCENDING), ("fps", pymongo.ASCENDING)])
     frames_col.create_index([("fps", pymongo.ASCENDING)])
+    frames_col.create_index([("video_id", pymongo.ASCENDING), ("fps", pymongo.ASCENDING), ("timestamp_sec", pymongo.ASCENDING)])
     logger.info("MongoDB indexes ensured on 'frames' collection.")
 
     # ── Discover videos ───────────────────────────────────────────────────────
