@@ -1,31 +1,30 @@
+
 """
-ingest.py — Offline database ingestion script for ClipMatch.
+ingest.py - Offline database ingestion script for ClipMatch.
 
-Run this script once (or whenever new videos are added) to:
-  1. Scan DB_VIDEOS_DIR for video files.
-  2. Extract frames at COARSE_FPS (1 FPS) and FINE_FPS (24 FPS).
-  3. Save each frame as a lossless PNG to PROCESSED_FRAMES_DIR.
-  4. Store frame metadata in MongoDB (collection: "frames").
+Responsibilities:
+  1. Scan DB_VIDEOS_DIR for source videos.
+  2. Extract frames at COARSE_FPS (normally 1 FPS).
+  3. Convert frames to grayscale and resize to FRAME_SIZE x FRAME_SIZE.
+  4. Save frames as PNG files.
+  5. Store frame metadata in MongoDB's "frames" collection.
+  6. Track completed ingestion in "ingestion_status".
 
-MongoDB document schema:
-  {
-    "video_id":      str,    # Stem of the video filename (e.g. "vid_042")
-    "frame_path":    str,    # Absolute path to the saved PNG file
-    "timestamp_sec": float,  # Position in the source video (seconds)
-    "fps":           int,    # Extraction rate used (1 or 24)
-  }
+Fine frames are NOT stored. The matcher extracts fine frames directly
+from the original video during the fine-matching stage.
 
 Usage:
   python ingest.py [--videos-dir PATH] [--force]
 
-  --videos-dir: Override DB_VIDEOS_DIR from .env (optional)
-  --force:      Re-ingest videos that already exist in MongoDB (default: skip)
+  --videos-dir: Override DB_VIDEOS_DIR.
+  --force:      Re-ingest videos even if already completed.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import sys
 from pathlib import Path
 
@@ -44,34 +43,47 @@ from config import (
     ensure_directories,
 )
 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
 logger = logging.getLogger("ingest")
 
-VIDEO_EXTENSIONS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".flv"}
+VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".avi",
+    ".mkv",
+    ".mov",
+    ".webm",
+    ".flv",
+}
 
-
-# ── Frame preprocessing ───────────────────────────────────────────────────────
 
 def _preprocess_frame(frame: np.ndarray) -> np.ndarray:
-    """BGR → grayscale → resize to FRAME_SIZE × FRAME_SIZE → uint8 [0, 255]."""
+    """Convert BGR to grayscale and resize to FRAME_SIZE x FRAME_SIZE."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    return cv2.resize(gray, (FRAME_SIZE, FRAME_SIZE), interpolation=cv2.INTER_AREA)
+
+    return cv2.resize(
+        gray,
+        (FRAME_SIZE, FRAME_SIZE),
+        interpolation=cv2.INTER_AREA,
+    )
 
 
-def _save_frame(frame: np.ndarray, dest: Path) -> bool:
-    """Save a preprocessed uint8 grayscale frame as PNG. Returns True on success."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    ok = cv2.imwrite(str(dest), frame)
-    if not ok:
-        logger.error("Failed to write frame to '%s'", dest)
-    return ok
+def _save_frame(frame: np.ndarray, destination: Path) -> bool:
+    """Save a preprocessed grayscale frame as a PNG."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
 
+    success = cv2.imwrite(str(destination), frame)
 
-# ── Per-video ingestion ───────────────────────────────────────────────────────
+    if not success:
+        logger.error("Failed to write frame: %s", destination)
+
+    return success
+
 
 def _ingest_video(
     video_path: Path,
@@ -80,28 +92,48 @@ def _ingest_video(
     collection: pymongo.collection.Collection,
 ) -> int:
     """
-    Extract frames from *video_path* at *target_fps*, save PNGs, and insert
-    metadata documents into *collection*.
+    Extract and save frames from one video.
 
-    Returns the number of frames successfully ingested.
+    Frame metadata is inserted only after extraction finishes successfully.
+
+    Returns:
+        Number of successfully ingested frames.
     """
     cap = cv2.VideoCapture(str(video_path))
+
     if not cap.isOpened():
-        logger.error("Cannot open video: %s", video_path)
-        return 0
+        raise RuntimeError(f"Cannot open video: {video_path}")
 
-    source_fps: float = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    frame_interval: int = max(1, round(source_fps / target_fps))
+    source_fps = cap.get(cv2.CAP_PROP_FPS)
 
-    frame_dir = PROCESSED_FRAMES_DIR / video_id / f"{target_fps}fps"
+    if not source_fps or source_fps <= 0:
+        cap.release()
+        raise RuntimeError(
+            f"Invalid source FPS reported for video: {video_path}"
+        )
+
+    frame_interval = max(1, round(source_fps / target_fps))
+
+    frame_dir = (
+        PROCESSED_FRAMES_DIR
+        / video_id
+        / f"{target_fps}fps"
+    )
+
+    # Remove frames from a previous incomplete attempt.
+    if frame_dir.exists():
+        shutil.rmtree(frame_dir)
+
     frame_dir.mkdir(parents=True, exist_ok=True)
 
-    docs: list[dict] = []
+    documents: list[dict] = []
+
     frame_index = 0
     saved_count = 0
 
     logger.info(
-        "  Extracting @ %d FPS (source %.1f FPS, interval=%d) from '%s'",
+        "Extracting at %d FPS "
+        "(source FPS: %.2f, frame interval: %d): %s",
         target_fps,
         source_fps,
         frame_interval,
@@ -110,115 +142,281 @@ def _ingest_video(
 
     try:
         while True:
-            ret, raw = cap.read()
-            if not ret:
+            success, raw_frame = cap.read()
+
+            if not success:
                 break
 
             if frame_index % frame_interval == 0:
                 timestamp_sec = frame_index / source_fps
-                processed = _preprocess_frame(raw)
+
+                processed_frame = _preprocess_frame(raw_frame)
 
                 frame_filename = f"frame_{frame_index:08d}.png"
-                frame_dest = frame_dir / frame_filename
+                frame_destination = frame_dir / frame_filename
 
-                if _save_frame(processed, frame_dest):
-                    docs.append(
-                        {
-                            "video_id": video_id,
-                            "frame_path": str(frame_dest.resolve()),
-                            "timestamp_sec": round(timestamp_sec, 4),
-                            "fps": target_fps,
-                        }
+                if not _save_frame(
+                    processed_frame,
+                    frame_destination,
+                ):
+                    raise RuntimeError(
+                        f"Failed to save frame: {frame_destination}"
                     )
-                    saved_count += 1
+
+                documents.append(
+                    {
+                        "video_id": video_id,
+                        "frame_path": str(
+                            frame_destination.resolve()
+                        ),
+                        "timestamp_sec": round(timestamp_sec, 4),
+                        "fps": target_fps,
+                    }
+                )
+
+                saved_count += 1
 
             frame_index += 1
+
     finally:
         cap.release()
 
-    if docs:
-        collection.insert_many(docs, ordered=False)
-        logger.info(
-            "  Inserted %d frame docs @ %d FPS for video_id='%s'",
-            len(docs),
-            target_fps,
-            video_id,
+    if saved_count == 0:
+        raise RuntimeError(
+            f"No frames were extracted from: {video_path}"
         )
+
+    # Insert metadata only after the complete extraction succeeds.
+    collection.insert_many(documents, ordered=True)
+
+    logger.info(
+        "Inserted %d frame documents for video_id='%s'.",
+        saved_count,
+        video_id,
+    )
 
     return saved_count
 
 
-# ── Main ingestion flow ───────────────────────────────────────────────────────
+def _source_metadata(video_path: Path) -> dict:
+    """Return source-file metadata used to detect changed videos."""
+    stat = video_path.stat()
+
+    return {
+        "source_size": stat.st_size,
+        "source_mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _is_ingestion_complete(
+    video_id: str,
+    video_path: Path,
+    frames_collection: pymongo.collection.Collection,
+    status_collection: pymongo.collection.Collection,
+) -> bool:
+    """
+    Check whether a video has a completed ingestion record
+    matching its current source-file metadata.
+    """
+    status = status_collection.find_one(
+        {"_id": video_id}
+    )
+
+    if not status or status.get("status") != "completed":
+        return False
+
+    current_metadata = _source_metadata(video_path)
+
+    if (
+        status.get("source_size") != current_metadata["source_size"]
+        or status.get("source_mtime_ns")
+        != current_metadata["source_mtime_ns"]
+    ):
+        return False
+
+    expected_count = status.get("frame_count", 0)
+
+    actual_count = frames_collection.count_documents(
+        {
+            "video_id": video_id,
+            "fps": COARSE_FPS,
+        }
+    )
+
+    return expected_count > 0 and actual_count == expected_count
+
 
 def ingest(videos_dir: Path, force: bool = False) -> None:
     """
-    Scan *videos_dir* for video files and ingest each one into MongoDB.
+    Ingest source videos into MongoDB.
 
-    Args:
-        videos_dir: Directory containing raw DB video files.
-        force:      If True, re-ingest even if the video_id already exists in MongoDB.
+    Only COARSE_FPS frames are persisted. Fine matching uses the
+    original video files separately.
     """
     ensure_directories()
 
-    # ── MongoDB setup ─────────────────────────────────────────────────────────
-    client = pymongo.MongoClient(MONGO_URI)
-    db = client[MONGO_DB_NAME]
-    frames_col = db["frames"]
+    videos_dir = videos_dir.resolve()
 
-    # Create indexes for efficient querying
-    frames_col.create_index([("video_id", pymongo.ASCENDING), ("fps", pymongo.ASCENDING)])
-    frames_col.create_index([("fps", pymongo.ASCENDING)])
-    logger.info("MongoDB indexes ensured on 'frames' collection.")
+    if not videos_dir.exists() or not videos_dir.is_dir():
+        raise FileNotFoundError(
+            f"Videos directory does not exist: {videos_dir}"
+        )
 
-    # ── Discover videos ───────────────────────────────────────────────────────
-    video_files = [
-        p for p in videos_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
-    ]
+    client = pymongo.MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=5000,
+    )
 
-    if not video_files:
-        logger.warning("No video files found in '%s'. Nothing to ingest.", videos_dir)
-        client.close()
-        return
+    try:
+        # Verify MongoDB connectivity before starting.
+        client.admin.command("ping")
 
-    logger.info("Found %d video(s) in '%s'.", len(video_files), videos_dir)
+        db = client[MONGO_DB_NAME]
 
-    total_frames = 0
+        frames_collection = db["frames"]
+        status_collection = db["ingestion_status"]
 
-    for video_path in sorted(video_files):
-        video_id = video_path.stem  # e.g. "vid_042" from "vid_042.mp4"
+        # Indexes used by the matching and ingestion workflows.
+        frames_collection.create_index(
+            [
+                ("video_id", pymongo.ASCENDING),
+                ("fps", pymongo.ASCENDING),
+            ]
+        )
 
-        # ── Skip if already ingested (unless --force) ─────────────────────────
-        if not force:
-            existing = frames_col.count_documents({"video_id": video_id})
-            if existing > 0:
-                logger.info(
-                    "Skipping '%s' (video_id='%s', %d docs exist). Use --force to re-ingest.",
-                    video_path.name,
+        frames_collection.create_index(
+            [("fps", pymongo.ASCENDING)]
+        )
+
+        logger.info("MongoDB connection successful.")
+        logger.info("MongoDB indexes ensured.")
+
+        video_files = sorted(
+            [
+                path
+                for path in videos_dir.iterdir()
+                if path.is_file()
+                and path.suffix.lower() in VIDEO_EXTENSIONS
+            ]
+        )
+
+        if not video_files:
+            logger.warning(
+                "No supported video files found in: %s",
+                videos_dir,
+            )
+            return
+
+        logger.info(
+            "Found %d source video(s).",
+            len(video_files),
+        )
+
+        total_frames = 0
+        completed_videos = 0
+        skipped_videos = 0
+        failed_videos = 0
+
+        for video_path in video_files:
+            video_id = video_path.stem
+
+            logger.info(
+                "Processing video: %s (video_id='%s')",
+                video_path.name,
+                video_id,
+            )
+
+            try:
+                if not force and _is_ingestion_complete(
                     video_id,
-                    existing,
+                    video_path,
+                    frames_collection,
+                    status_collection,
+                ):
+                    logger.info(
+                        "Skipping '%s': ingestion already complete.",
+                        video_path.name,
+                    )
+                    skipped_videos += 1
+                    continue
+
+                # Remove old or incomplete metadata before retrying.
+                deleted = frames_collection.delete_many(
+                    {"video_id": video_id}
+                ).deleted_count
+
+                if deleted:
+                    logger.info(
+                        "Removed %d previous frame documents.",
+                        deleted,
+                    )
+
+                status_collection.delete_one(
+                    {"_id": video_id}
                 )
-                continue
-        else:
-            # Remove stale documents for this video
-            deleted = frames_col.delete_many({"video_id": video_id}).deleted_count
-            if deleted:
+
+                # Store only coarse frames.
+                frame_count = _ingest_video(
+                    video_path=video_path,
+                    video_id=video_id,
+                    target_fps=COARSE_FPS,
+                    collection=frames_collection,
+                )
+
+                metadata = _source_metadata(video_path)
+
+                # Mark completion only after frame insertion succeeds.
+                status_collection.update_one(
+                    {"_id": video_id},
+                    {
+                        "$set": {
+                            "status": "completed",
+                            "video_id": video_id,
+                            "video_filename": video_path.name,
+                            "fps": COARSE_FPS,
+                            "frame_count": frame_count,
+                            **metadata,
+                        }
+                    },
+                    upsert=True,
+                )
+
+                total_frames += frame_count
+                completed_videos += 1
+
                 logger.info(
-                    "  Removed %d stale docs for video_id='%s'.", deleted, video_id
+                    "Completed '%s': %d coarse frames.",
+                    video_path.name,
+                    frame_count,
                 )
 
-        logger.info("Ingesting '%s' (video_id='%s') …", video_path.name, video_id)
+            except Exception:
+                failed_videos += 1
 
-        # Ingest at both coarse and fine FPS rates
-        for fps in (COARSE_FPS, FINE_FPS):
-            n = _ingest_video(video_path, video_id, fps, frames_col)
-            total_frames += n
+                logger.exception(
+                    "Failed to ingest video: %s",
+                    video_path.name,
+                )
 
-    logger.info("Ingestion complete. Total frames stored: %d.", total_frames)
-    client.close()
+        logger.info("=" * 55)
+        logger.info("INGESTION SUMMARY")
+        logger.info("Newly completed videos : %d", completed_videos)
+        logger.info("Skipped videos         : %d", skipped_videos)
+        logger.info("Failed videos          : %d", failed_videos)
+        logger.info("New coarse frames      : %d", total_frames)
+        logger.info("Stored FPS             : %d", COARSE_FPS)
+        logger.info("Fine matching FPS      : %d (extracted live)", FINE_FPS)
+        logger.info("=" * 55)
 
+        if failed_videos:
+            logger.warning(
+                "Some videos failed. Run the script again to retry them."
+            )
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+    finally:
+        client.close()
+        logger.info("MongoDB connection closed.")
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -226,37 +424,54 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+
     parser.add_argument(
         "--videos-dir",
         type=Path,
         default=DB_VIDEOS_DIR,
-        help=f"Directory containing source video files (default: {DB_VIDEOS_DIR})",
+        help=(
+            "Directory containing source videos "
+            f"(default: {DB_VIDEOS_DIR})"
+        ),
     )
+
     parser.add_argument(
         "--force",
         action="store_true",
         default=False,
-        help="Re-ingest videos already present in MongoDB (deletes existing docs first).",
+        help=(
+            "Re-ingest videos even if already completed. "
+            "Existing frame documents are deleted first."
+        ),
     )
+
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
 
-    videos_dir: Path = args.videos_dir.resolve()
-    if not videos_dir.exists():
-        logger.error("Videos directory does not exist: %s", videos_dir)
-        sys.exit(1)
+    videos_dir = args.videos_dir.resolve()
 
     logger.info("=== ClipMatch Ingestion ===")
-    logger.info("Videos dir    : %s", videos_dir)
-    logger.info("Frames dir    : %s", PROCESSED_FRAMES_DIR.resolve())
-    logger.info("MongoDB URI   : %s", MONGO_URI)
-    logger.info("Coarse FPS    : %d", COARSE_FPS)
-    logger.info("Fine FPS      : %d", FINE_FPS)
-    logger.info("Frame size    : %dx%d", FRAME_SIZE, FRAME_SIZE)
-    logger.info("Force re-ingest: %s", args.force)
-    logger.info("=" * 40)
+    logger.info("Videos directory : %s", videos_dir)
+    logger.info(
+        "Frames directory : %s",
+        PROCESSED_FRAMES_DIR.resolve(),
+    )
+    logger.info("MongoDB database: %s", MONGO_DB_NAME)
+    logger.info("Coarse FPS      : %d", COARSE_FPS)
+    logger.info("Fine FPS        : %d (not stored)", FINE_FPS)
+    logger.info(
+        "Frame size      : %d x %d",
+        FRAME_SIZE,
+        FRAME_SIZE,
+    )
+    logger.info("Force re-ingest : %s", args.force)
+    logger.info("=" * 55)
 
-    ingest(videos_dir, force=args.force)
+    try:
+        ingest(videos_dir, force=args.force)
+    except Exception:
+        logger.exception("Ingestion process failed.")
+        sys.exit(1)
