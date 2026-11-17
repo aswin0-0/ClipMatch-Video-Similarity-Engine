@@ -505,7 +505,7 @@ def parse_args():
     )
     parser.add_argument(
         "--method",
-        choices=["diagonal", "standard"],
+        choices=["diagonal", "standard", "alternate"],
         default="diagonal",
         help="NCC matching method (default: diagonal)",
     )

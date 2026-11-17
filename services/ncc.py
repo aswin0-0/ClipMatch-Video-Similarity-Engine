@@ -6,6 +6,13 @@ NCC formula (zero-mean):
 
 A score of 1.0 means perfect correlation; 0.0 means no correlation.
 All functions are pure NumPy — no OpenCV dependencies.
+
+Supported methods:
+  - 'standard'  : Full 256×256 pixel NCC (most accurate).
+  - 'diagonal'  : Only the 256 main-diagonal pixels (~256× faster).
+  - 'alternate' : Every 3rd pixel across every row (pattern: o x x o x x …).
+                  Keeps ~1/3 of all pixels (≈21,845 of 65,536), giving a
+                  good spatial coverage vs. speed trade-off.
 """
 
 from __future__ import annotations
@@ -19,6 +26,27 @@ logger = logging.getLogger(__name__)
 
 # ── Core NCC function ─────────────────────────────────────────────────────────
 
+def _alternate_pixels(frame: np.ndarray, period: int = 3) -> np.ndarray:
+    """
+    Extract every *period*-th pixel along each row of *frame*.
+
+    For a 256×256 frame with period=3, this produces a 1-D vector of
+    256 × ceil(256/3) ≈ 21,845 values arranged in the pattern:
+        o x x o x x o x x …   (column indices 0, 3, 6, …)
+
+    This is ~3× more pixels than diagonal (256) while still being ~3× faster
+    than the full 65,536-pixel standard mode.
+
+    Args:
+        frame:  2-D float32 array of shape (H, W).
+        period: Column sampling stride (default 3 → keep every 3rd column).
+
+    Returns:
+        1-D float64 array of the selected pixels.
+    """
+    return frame[:, ::period].flatten().astype(np.float64)
+
+
 def ncc_score(frame_a: np.ndarray, frame_b: np.ndarray, method: str = "standard") -> float:
     """
     Compute the zero-mean Normalized Cross-Correlation between two frames.
@@ -28,7 +56,9 @@ def ncc_score(frame_a: np.ndarray, frame_b: np.ndarray, method: str = "standard"
     Args:
         frame_a: Query frame (float32, already normalized to [0,1]).
         frame_b: Database frame (float32, already normalized to [0,1]).
-        method:  'standard' for full image NCC, 'diagonal' for just the main diagonal pixels.
+        method:  'standard' for full image NCC, 'diagonal' for just the main
+                 diagonal pixels, or 'alternate' for every 3rd column across
+                 all rows.
 
     Returns:
         NCC score in [0.0, 1.0]. Returns 0.0 if either frame is constant.
@@ -36,6 +66,9 @@ def ncc_score(frame_a: np.ndarray, frame_b: np.ndarray, method: str = "standard"
     if method == "diagonal":
         a = np.diag(frame_a).astype(np.float64)
         b = np.diag(frame_b).astype(np.float64)
+    elif method == "alternate":
+        a = _alternate_pixels(frame_a)
+        b = _alternate_pixels(frame_b)
     else:
         a = frame_a.flatten().astype(np.float64)
         b = frame_b.flatten().astype(np.float64)
@@ -75,6 +108,26 @@ def patch_pass_ratio(
 
         patches_a = diagonal_a[:usable_length].reshape(grid_size, -1)
         patches_b = diagonal_b[:usable_length].reshape(grid_size, -1)
+        patches_a -= patches_a.mean(axis=1, keepdims=True)
+        patches_b -= patches_b.mean(axis=1, keepdims=True)
+        norms = np.linalg.norm(patches_a, axis=1) * np.linalg.norm(patches_b, axis=1)
+        scores = np.divide(
+            np.sum(patches_a * patches_b, axis=1),
+            norms,
+            out=np.zeros_like(norms),
+            where=norms >= 1e-8,
+        )
+        return float(np.mean(np.maximum(0.0, scores) >= threshold))
+
+    if method == "alternate":
+        alt_a = _alternate_pixels(frame_a)
+        alt_b = _alternate_pixels(frame_b)
+        usable_length = (len(alt_a) // grid_size) * grid_size
+        if usable_length == 0:
+            return 0.0
+
+        patches_a = alt_a[:usable_length].reshape(grid_size, -1)
+        patches_b = alt_b[:usable_length].reshape(grid_size, -1)
         patches_a -= patches_a.mean(axis=1, keepdims=True)
         patches_b -= patches_b.mean(axis=1, keepdims=True)
         norms = np.linalg.norm(patches_a, axis=1) * np.linalg.norm(patches_b, axis=1)
