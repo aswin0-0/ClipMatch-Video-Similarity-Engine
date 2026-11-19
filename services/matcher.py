@@ -180,16 +180,19 @@ def _coarse_search_live(
             idx, total_videos, n_query, len(db_frames), method,
         )
 
-        scored = sliding_window_ncc(
+        scored_oriented = sliding_window_ncc_oriented(
             query_frames_only,
             db_frames,
             step=1,
             method=method,
+            mirror_matching=ENABLE_MIRROR_MATCHING,
             enable_patch_early_rejection=ENABLE_PATCH_EARLY_REJECTION,
             patch_grid_size=PATCH_GRID_SIZE,
             patch_score_threshold=PATCH_SCORE_THRESHOLD,
             patch_min_pass_ratio=PATCH_MIN_PASS_RATIO,
         )
+        # Drop orientation field for threshold comparison (keep score + timestamp)
+        scored = [(s, t) for s, t, _ in scored_oriented]
 
         if scored:
             best_score, best_ts = max(scored, key=lambda x: x[0])

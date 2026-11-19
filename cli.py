@@ -84,8 +84,8 @@ def main():
     # 1.5 Get method from user
     print("\nSelect Matching Method:")
     print("  1. Standard (Full 256x256 Frame NCC)")
-    print("  2. Faster   (Diagonal pixels only, ~256x faster)")
-    print("  3. Faster+  (Alternate pixels every 3rd column, ~3x faster than standard)")
+    print("  2. Diagonal (Diagonal pixels only, ~256x faster)")
+    print("  3. Alternate  (Alternate pixels every 3rd column, ~3x faster than standard)")
     method_choice = input("Enter choice (1, 2, or 3) [default=1]: ").strip()
     if method_choice == "2":
         method = "diagonal"
